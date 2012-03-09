@@ -1,0 +1,406 @@
+<?php
+/**
+ * Implements hook_permission().
+ */
+function migration_permission() {
+  return array(
+    'run migration' => array(
+      'title' => t('Run Migration'),
+      'description' => t('Run a migration from the old system'),
+      'restrict access' => TRUE,
+    ),
+  );  
+}
+
+/**
+ * Implements hook_menu().
+ */
+function migration_menu() {
+  $items = array();
+  $items['admin/content/migration'] = array(
+    'title' => 'Migrate',
+    'access arguments' => array( 'run migration' ),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array( 'migration_form' ),
+    'type' => MENU_NORMAL_ITEM,
+    'weight' => 100,
+  );
+  return $items;
+}
+
+function migration_step_message(&$context, $message) {
+  $step = $context['sandbox']['step'];
+  
+  $context['message'] .= '<br>' . $message;
+  $context['results'][$step]['results'][] = $message;
+}
+
+function migration_step_error(&$context, $message) {
+  $step = $context['sandbox']['step'];
+  
+  $context['message'] .= '<br>' . $message;
+  $context['results'][$step]['errors'][] = $message;
+  watchdog('migration', $message);
+}
+
+/**
+ * Initializes each run of a migration batch operation.  If the sandbox is not yet
+ * setup, it will be initialized with the proper values.  If a count query is provided,
+ * it will be run at the beginning to get the total number of records to process, and 
+ * it will also be run at the end to make sure that the total number hasn't changed. 
+ * 
+ * @param array $context The batch context object.  After this function runs, it will
+ *   containing the following properties:
+ *   - sandbox: Storage for settings for this operation only
+ *     - max: The total number of records
+ *     - offset: The number of records processed so far
+ *   - results: Storage for settings for all operations in this batch.  It will be 
+ *     keyed by the name of the step that is running and will contain:
+ *     - start: The start time of this operation.
+ *     - results: A list of results from this operation.
+ * @param string $step The name of the step that is running, defined in hook_migration_steps().
+ * @param string $count_query If provided, this should be a SQL statement that returns one columns
+ *   containing a COUNT(*) of the number of records to process in this migration step.
+ * @param array $count_params If provided, this is an array of parameters to pass to the $count_query.
+ *   This should be keyed as necessary for db_query().
+ */
+function migration_step_init(&$context, $step, $count_query = NULL, $count_params = array(), $count_target = 'default') {
+  if (empty($context['sandbox'])) {
+    $context['sandbox']['step'] = $step;
+
+    // If a count query was provided, calculate the total number of records.
+    if (isset($count_query)) {
+      $query = Database::getConnection('default', $count_target)->query($count_query, $count_params);
+      
+      $context['sandbox']['max'] = $query->fetchField();
+      $context['sandbox']['count_query'] = $count_query;
+      $context['sandbox']['count_params'] = $count_params;
+      $context['sandbox']['count_target'] = $count_target;
+    }
+    // Otherwise, you should set the total yourself.
+    else {
+      $context['sandbox']['max'] = 0;
+    }
+    $context['sandbox']['offset'] = 0;
+    $context['results'][$step]['start'] = time();
+    $context['results'][$step]['results'] = array();
+  }
+  
+  $steps = migration_steps();
+  $context['message'] = t('@title: Completed @offset of @max', array(
+    '@offset' => number_format($context['sandbox']['offset']),
+    '@max' => number_format($context['sandbox']['max']),
+    '@title' => $steps[$step]['title'],
+  ));
+}
+
+/**
+ * Increments the offset keeping track of how many records have been processed.
+ * This should be called once per iteration of your loop. 
+ * 
+ * @param array $context The batch context object, as defined in migration_step_init().
+ */
+function migration_step_next(&$context) {
+  $context['sandbox']['offset']++;
+}
+
+/**
+ * Forces a migration step to end, even if it wouldn't have otherwise.
+ * 
+ * @param array $context The batch context object, as defined in migration_step_init().
+ */
+function migration_step_end(&$context) {
+  $step = $context['sandbox']['step'];
+  
+  $context['finished'] = 1;
+  $context['results'][$step]['end'] = time();
+}
+
+/**
+ * Calculates how much of the migration step has been completed.  
+ * This should be called at the end of your processing loop.
+ * 
+ * The 'finished' property of the context will be set with the percentage of the 
+ * migration step that has been completed, based on the 'max' and 'offset' properties.
+ *  
+ * If a $count_query was provided in migration_step_init(), it will be run again to 
+ * see whether any additional records were added while the migration was running.
+ *  
+ * @param array $context The batch context object, as defined in migration_step_init().
+ */
+function migration_step_finish(&$context) {
+  $step = $context['sandbox']['step'];
+  
+  if ($context['sandbox']['max'] == 0) {
+    $context['finished'] = 1;
+  }
+  else {
+    $context['finished'] = $context['sandbox']['offset'] / $context['sandbox']['max'];
+    
+    // If we've reached the end...
+    if ($context['finished'] >= 1) {
+      
+      // Make sure there aren't any new records
+      if (isset($context['sandbox'][$step]['count_query'])) {
+        $count_query = $context['sandbox']['count_query'];
+        $count_params = $context['sandbox']['count_params'];
+        $count_target = $context['sandbox']['count_target'];
+        
+        $query = Database::getConnection('default', $count_target)->query($count_query, $count_params);
+        $max = $query->fetchField();
+        
+        if ($max != $context['sandbox']['max']) {
+          $context['sandbox']['max'] = $max;
+          $context['finished'] = $context['sandbox']['offset'] / $context['sandbox']['max'];
+        }
+      }
+    }
+  }
+  if ($context['finished'] >= 1) {
+    $context['results'][$step]['end'] = time();
+  }
+}
+
+/**
+ * Returns a keyed array of available migration steps, using hook_migration_steps.
+ * Each will have the following keys:
+ *   - title: The name of the step to display.
+ *   - callback: The function that executes the step.
+ *   - confirm: Optional; set to TRUE to require confirmation before running the step.
+ *   - confirm message: If confirm is true, this is the message to be displayed in the confirm form.
+ *   - count: The number of records to process in each iteration.
+ * 
+ * @param string $step Optionally, the name of a single step to return.
+ */
+function migration_steps($step = NULL) {
+  return module_info_invoke_all('migration_steps', array(
+    'title' => '',
+    'confirm' => FALSE,
+    'count' => 100,
+  ), $step);
+}
+
+function migration_form($form, &$form_state) {
+  if (!empty($form_state['confirm'])) {
+    $step = $form_state['step'];
+    
+    $form['step'] = array(
+      '#type' => 'hidden',
+      '#value' => $form_state['values']['step'],
+    );
+    
+    return confirm_form(
+      $form,
+      t('Are you sure you want to %action', array(
+        '%action' => $step['title'],
+      )),
+      'admin/content/migration',
+      (!empty($step['confirm message']) ? $step['confirm message'] : NULL),
+      t('Delete'),
+      t('Cancel')
+    );
+  }
+  
+  $steps = migration_steps();
+  $options = array();
+  
+  foreach ($steps as $key => $step) {
+    $options[$key] = array(
+      'title' => $step['title'],
+    );
+  }
+  
+  $form['step'] = array(
+    '#type' => 'tableselect',
+    '#multiple' => TRUE,
+    '#title' => t('Next step to run?'),
+    '#header' => array(
+      'title' => t('Step'),
+    ),
+    '#options' => $options,
+    '#default_value' => !empty($_GET['step']) ? $_GET['step'] : array('all'),
+  );
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Go'),
+  );
+  return $form;
+}
+
+function migration_form_submit(&$form, &$form_state) {
+  $info = migration_steps();
+  $steps = $form_state['values']['step'];
+  
+  foreach ($steps as $step => $value) {
+    if (isset($info[$step]) && $value) {
+      // If this step needs confirmation, get it.
+      if (!empty($info[$step]['confirm']) && empty($form_state['confirm'])) {
+        $form_state['confirm'] = TRUE;
+        $form_state['step'] = $steps[$step];
+        $form_state['rebuild'] = TRUE;
+        return;
+      }
+      
+      $steps[$step] = $info[$step];
+    }
+    else {
+      unset($steps[$step]);
+    }
+  }
+  $title = format_plural(count($steps), 'Migrating 1 step...', 'Migrating @count steps...');
+  
+  $operations = array();
+  foreach ($steps as $key => $step) {
+    // Don't do any steps that require confirmation unless we got it already
+    if (!empty($step['confirm']) && empty($form_state['confirm'])) {
+      continue;
+    }
+    $callback = module_info_get_callback($step);
+    if ($callback) {
+      $operations[] = array( $callback, array($key) );
+    }
+  }
+  
+  batch_set(array(
+    'title' => $title,
+    'operations' => $operations,
+    'finished' => 'migration_form_done',
+    'url_options' => array(
+      'query' => array( 'step' => $step ),
+    ),
+    'progress_message' => t('Completed @current of @total in @elapsed (@estimate remaining).'),
+  ));
+}
+
+function migration_form_done($success, $results, $operations) {
+  $steps = migration_steps();
+  
+  if ($success) {
+    foreach ($results as $step => $data) {
+      $s = $steps[$step];
+      
+      drupal_set_message(t('Migrated %count @title in @time', array(
+        '%count' => count($data['results']),
+        '@title' => $s['title'],
+        '@time' => format_interval($data['end'] - $data['start'], 2),
+      )));
+    }
+  }
+  else {
+    drupal_set_message(t('An error occurred in migration.'), 'error');
+  }
+}
+
+function migration_get_term($name, $vids) {
+  $terms = taxonomy_term_load_multiple(array(), array('name' => $name, 'vid' => $vids));
+  return reset($terms);
+}
+
+function migration_get_username($email, $uid = 0) {
+  $name = substr($email, 0, 60);
+  $tempname = $name;
+  
+  while (db_query("
+    	SELECT COUNT(*) FROM {users} 
+    	WHERE LOWER(name) = LOWER(:name)
+    	  AND uid <> :uid
+   	",
+    array(
+     ':name' => $tempname,
+     ':uid' => $uid,
+    ))->fetchField(0) > 0) {
+      
+    if (empty($counter)) {
+      $counter = 1;
+    }
+    else {
+      $counter++;
+    }
+    $tempname = $name . $counter;
+  }
+  return $tempname;
+}
+
+function migration_update_password($uid, $password) {
+  $new_hash = user_hash_password($password, 11);
+  if ($new_hash) {
+    $new_hash  = 'U' . $new_hash;
+    db_update('users')
+    ->fields(array('pass' => $new_hash))
+    ->condition('uid', $uid)
+    ->execute();
+  }
+}
+
+function migration_get_user($email) {
+  $users = &drupal_static(__FUNCTION__);
+  if (empty($users[$email])) {
+    $uid = db_select('users', 'u')
+      ->fields('u', array('uid'))
+      ->condition('mail', $email)
+      ->execute()
+      ->fetchColumn();
+      
+    if (!empty($uid)) {
+      $users[$email] = $uid;
+    }
+  }
+  return $users[$email];
+}
+
+/**
+ * Downloads a file from a remote location into Drupal.  If the file already exists
+ * it won't be downloaded again.
+ * 
+ * @param string $remote_url The URL of the file.
+ * @param string $local_dir The path of the directory where the file will be moved.
+ *   This should start with public:// etc.
+ *   
+ * @return object The file object representing the file within Drupal.
+ */
+function migration_download_file($remote_url, $local_dir) {
+  $filename = basename($remote_url);
+  
+  // See if the file already exists locally
+  $local_url = "$local_dir/$filename";
+  
+  $file = FALSE;
+  $files = file_load_multiple(array(), array('uri' => $local_url));
+  if (!empty($files)) {
+    $file = reset($files);
+  }
+  
+  if (!$file || !file_exists($local_url)) {
+    // Download the image into a temporary directory
+    $mime = file_get_mimetype($image);
+    $tmp_dir = realpath(file_directory_temp()) . "/files/$mime";
+    $tmp_url = "$tmp_dir/$filename";
+    
+    drupal_mkdir($tmp_dir, NULL, TRUE);
+    copy($remote_url, $tmp_url);
+    
+    if (!file_exists($tmp_url)) {
+      return FALSE;
+    }
+  
+    // Create a File object if we don't already have one
+    if (!$file) {
+      $file = (object) array(
+        'uid' => 1,
+        'uri' => $tmp_url,
+        'filename' => $filename,
+        'filemime' => $mime,
+        'status' => 1,
+      );
+    }
+    else {
+      $file->uri = $tmp_url;
+    }
+    
+    // Move the image into its public location
+    drupal_mkdir($local_dir, NULL, TRUE);
+    $file = file_copy($file, $local_url, FILE_EXISTS_REPLACE);
+    drupal_unlink($tmp_url);
+  }
+  return $file;
+}

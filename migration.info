@@ -1,0 +1,7 @@
+name = Migration
+description = "Provides a framework for developing scripts to migrate data from an old system."
+package = Migration
+core = 7.x
+version = "7.x-1.x-dev"
+
+dependencies[] = module_info
